@@ -79,9 +79,6 @@ def stream_audio(text):
         data=json.dumps(payload),
         stream=True
     )
-    for chunk in response.iter_content(chunk_size=4096):
-        if chunk:
-            yield base64.b64encode(chunk).decode("utf-8") + "\n"
 
     if response.status_code == 200:
         for chunk in response.iter_content(chunk_size=4096):
