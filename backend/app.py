@@ -1,6 +1,6 @@
 from flask_cors import CORS
 import assemblyai as aai
-from flask import Flask,request, stream_with_context, stream_with_context
+from flask import Flask, jsonify,request, stream_with_context, stream_with_context
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
@@ -53,6 +53,17 @@ CRITICAL: Read the conversation history carefully. Only acknowledge what the can
 
 Keep it short, conversational, and adaptive!"""
 
+FEEDBACK_PROMPT = """Based on our complete interview conversation, provide detailed feedback.
+IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text before or after.
+Address the candidate directly using "you" and "your" (e.g., "You explained..." not "The candidate explained...").
+Respond with ONLY this JSON structure (no markdown, no code blocks, no extra text):
+{{
+    "subject": "{subject}",
+    "candidate_score": <1-5>,
+    "feedback": "<detailed strengths with specific examples from their ACTUAL answers>",
+    "areas_of_improvement": "<constructive suggestions based on gaps you noticed>"
+}}
+Be specific - reference ACTUAL things they said during the interview."""
 
 # converting text to audio:
 def stream_audio(text):
@@ -97,7 +108,7 @@ def speech_to_text(audio_path):
 
 
 app = Flask(__name__)
-CORS(app, expose_headers=['X-Question-Number'])
+CORS(app,expose_headers=["X-Question-Number"])
 
 @app.route("/start-interview", methods=["POST"])
 def start_interview():
@@ -132,7 +143,7 @@ def start_interview():
 
 @app.route("/submit-answer", methods=["POST"])
 def submit_answer():
-    
+
     global question_count
 
     audio_file = request.files["audio"]
@@ -153,35 +164,29 @@ def submit_answer():
     print(f"[Answer {question_count}] {answer}")
 
     # return {"message": "Answer received successfully"}, 200 # just for testing 
-
-    config = {"configurable": {"thread_id": thread_id}}
-    agent.invoke({
-        "messages":[
-            {
-                "role":"user",
-                "content": answer
-            }
-        ]
-    },config=config) 
     
+    config = {"configurable": {"thread_id": thread_id}}
 
+    agent.invoke({"messages": [{"role": "user", "content": answer}]}, config=config)
 
     question_count+=1
-    prompt = f"""The candidate just answered question {question_count - 1}.
- 
-    Look at their ACTUAL answer above. Do NOT assume or make up what they said.
-    
-    Now ask question {question_count} of 5:
-    1. Briefly acknowledge what they ACTUALLY said (1 sentence) - quote their exact words if needed
-    2. Ask your next question that builds on their REAL response (1-2 sentences)
-    3. If they said "I don't know" or gave a wrong answer, acknowledge that and ask something simpler
-    4. Keep the TOTAL response under 3 sentences
-    
-    Be conversational but CONCISE. Only reference what they truly said."""
 
+    prompt = """The candidate just answered question {question_count - 1}.
+   
+      Look at their ACTUAL answer above. Do NOT assume or make up what they said.
+      
+      Now ask question {question_count} of 5:
+      1. Briefly acknowledge what they ACTUALLY said (1 sentence) - quote their exact words if needed
+      2. Ask your next question that builds on their REAL response (1-2 sentences)
+      3. If they said "I don't know" or gave a wrong answer, acknowledge that and ask something simpler
+      4. Keep the TOTAL response under 3 sentences"""
+
+    
     response = agent.invoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
     question = response["messages"][-1].content
+
     print(f"\n[Question {question_count}] {question}")
+
     return (stream_audio(question),
         {
         'Content-Type': 'text/plain',
@@ -189,9 +194,29 @@ def submit_answer():
         }
     )
 
+@app.route("/get-feedback",methods=["POST"])
+def get_feedback():
+    pass 
+    """Generate detailed interview feedback"""
+    config = {"configurable": {"thread_id": thread_id}}
+    response = agent.invoke({
+        "messages": [
+        {
+            "role": "user", 
+            "content": f"{FEEDBACK_PROMPT}\n\nReview our complete {current_subject} interview conversation and provide detailed feedback."
+        }
+        ]
+    }, config=config)
 
-    
+    text = response["messages"][-1].content
 
+    print(f"\n[Feedback Generated]\n{text}\n")
 
+    cleaned = text.strip()
+    if "```" in cleaned:
+        cleaned = cleaned.split("```")[1].replace("json", "").strip()
+    feedback = json.loads(cleaned)
+
+    return jsonify({"success": True, "feedback": feedback})
 
 app.run(debug=True, port=5000)

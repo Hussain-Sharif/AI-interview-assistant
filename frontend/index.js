@@ -401,7 +401,7 @@ async function endInterview() {
     await getFeedback();
 }
 
-const getFeedbackApiUrl = "YOUR_GET_FEEDBACK_API_URL_HERE";
+const getFeedbackApiUrl = "http://127.0.0.1:5000/get-feedback";
 
 async function getFeedback() {
     showFeedbackSection();
