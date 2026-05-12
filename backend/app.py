@@ -1,19 +1,23 @@
-from flask import Flask,request
 from flask_cors import CORS
-
+import assemblyai as aai
+from flask import Flask,request, stream_with_context, stream_with_context
 from langchain.chat_models import init_chat_model
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
+import json
+import requests
+import base64
+import tempfile
 
 from dotenv import load_dotenv
 import os
-import requests
-import json
-import base64
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY=os.getenv("GOOGLE_API_KEY")
 MURF_API_KEY = os.getenv("MURF_API_KEY")
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+aai.settings.api_key = ASSEMBLYAI_API_KEY
+
 
 checkpointer = InMemorySaver()
 
@@ -27,6 +31,11 @@ agent = create_agent(
     tools=[],
     checkpointer=checkpointer
 )
+
+
+question_count = 0
+current_subject = ""
+thread_id = "interview_session_1"
 
 
 INTERVIEW_PROMPT = """You are Natalie, a friendly and conversational interviewer conducting a natural {subject} interview.
@@ -45,19 +54,7 @@ CRITICAL: Read the conversation history carefully. Only acknowledge what the can
 Keep it short, conversational, and adaptive!"""
 
 
-
-# Flask Instance 
-app = Flask(__name__)
-CORS(app)
-
-
-# Global Variables:
-question_count = 0
-current_subject = ""
-thread_id = "interview_session_1"
-
-
-# audio:
+# converting text to audio:
 def stream_audio(text):
     BASE_URL = "https://global.api.murf.ai/v1/speech/stream"
     payload = {
@@ -80,34 +77,46 @@ def stream_audio(text):
         stream=True
     )
 
-    if response.status_code == 200:
-        for chunk in response.iter_content(chunk_size=4096):
-            if chunk:
-                yield base64.b64encode(chunk).decode("utf-8") + "\n"
-        print("Audio streaming completed")
-    else:
-
-        print(f"Error: {response.status_code}")
+    for chunk in response.iter_content(chunk_size=4096):
+        if chunk:
+            yield base64.b64encode(chunk).decode("utf-8") + "\n"
 
 
-# Routes:
-@app.route('/start-interview',methods=["POST"])
+# Convert the audio to Text:
+def speech_to_text(audio_path):
+
+    """Converts an audio file to text using AssemblyAI."""
+    transcriber = aai.Transcriber() # Instance of this CLass!
+    config = aai.TranscriptionConfig(
+        speech_models=["universal-3-pro", "universal-2"],
+        language_detection=True, speaker_labels=True,
+    )
+    transcript = transcriber.transcribe(audio_path, config=config)
+    return transcript.text if transcript.text else ""
+
+
+
+app = Flask(__name__)
+CORS(app, expose_headers=['X-Question-Number'])
+
+@app.route("/start-interview", methods=["POST"])
 def start_interview():
-    print("\n[INFO] Starting interview session...")
-    global current_subject, thread_id, question_count, checkpointer, agent
-    data=request.json
-    current_subject = data.get("subject","Python")
-    question_count = 1
-
-    checkpointer = InMemorySaver() 
+    global question_count, current_subject, checkpointer, agent
+    data=request.json 
+    subject = data.get("subject","Python")
+    question_count=1
+    current_subject=subject
+    checkpointer = InMemorySaver()
     agent = create_agent(
         model=model,
         tools=[],
         checkpointer=checkpointer
     )
+
     config = {"configurable": {"thread_id": thread_id}}
     formatted_prompt = INTERVIEW_PROMPT.format(subject=current_subject)
 
+    
     response = agent.invoke({
         "messages": [
             {"role": "system", "content": formatted_prompt},
@@ -116,10 +125,73 @@ def start_interview():
     }, config=config)
 
     question = response["messages"][-1].content
+    print(f"\n[Question {question_count}] {question}") 
+    return stream_audio(question), {"Content-Type":"text/plain"}
+
+
+
+@app.route("/submit-answer", methods=["POST"])
+def submit_answer():
+    
+    global question_count
+
+    audio_file = request.files["audio"]
+    temp_path = (
+    tempfile.NamedTemporaryFile(
+      delete=False,
+      suffix=".webm"
+     ).name
+    ) 
+
+    audio_file.save(temp_path)
+
+    answer = speech_to_text(temp_path)
+
+    os.unlink(temp_path)
+    if not answer:
+        answer = "Empty Text received"
+    print(f"[Answer {question_count}] {answer}")
+
+    # return {"message": "Answer received successfully"}, 200 # just for testing 
+
+    config = {"configurable": {"thread_id": thread_id}}
+    agent.invoke({
+        "messages":[
+            {
+                "role":"user",
+                "content": answer
+            }
+        ]
+    },config=config) 
+    
+
+
+    question_count+=1
+    prompt = f"""The candidate just answered question {question_count - 1}.
+ 
+    Look at their ACTUAL answer above. Do NOT assume or make up what they said.
+    
+    Now ask question {question_count} of 5:
+    1. Briefly acknowledge what they ACTUALLY said (1 sentence) - quote their exact words if needed
+    2. Ask your next question that builds on their REAL response (1-2 sentences)
+    3. If they said "I don't know" or gave a wrong answer, acknowledge that and ask something simpler
+    4. Keep the TOTAL response under 3 sentences
+    
+    Be conversational but CONCISE. Only reference what they truly said."""
+
+    response = agent.invoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    question = response["messages"][-1].content
     print(f"\n[Question {question_count}] {question}")
+    return (stream_audio(question),
+        {
+        'Content-Type': 'text/plain',
+        'X-Question-Number': str(question_count)
+        }
+    )
 
-    return stream_audio(question), {"content-type":"text/plain"}
+
+    
 
 
 
-app.run(debug=True,port=5000)
+app.run(debug=True, port=5000)
